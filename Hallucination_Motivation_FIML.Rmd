@@ -1,0 +1,737 @@
+---
+title: "Erroneous AI-Generated Feedback on Motivation and Engagement"
+output: html_notebook
+---
+# Load Packages and Data
+
+```{r}
+packages <- c("dplyr", "tidyr", "openxlsx", "reshape",  "lme4", "lmerTest", "emmeans", "Hmisc", "ggplot2", "lavaan")
+
+sapply(packages, function(pkg) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+  library(pkg, character.only = TRUE)
+})
+lapply(packages, library, character.only = TRUE)
+dat1 <- readRDS("hallucination_dat_wide_clean.rds")
+```
+
+
+## Exclude Cases
+
+We exclude participants for the same reasons as in the previous manuscript on the same data set. We exclude participants who did not have at least one step in at least one lesson, participants who did not have at least one value for learning gain, and participants who did not indicate to be above 18 years old.
+
+```{r}
+# Now lets exclude cases with steps <4
+# how many unique user_ids do we have before and after excluding cases with steps <4?
+# then we know how many users we excluded completely
+lesson_suffixes <- c("I", "C", "S")
+steps_cols <- paste0("steps_", lesson_suffixes)
+gain_cols  <- paste0("gain_", lesson_suffixes)
+
+before_exclusion <- dat1
+bef_exclusion_steps <- length(unique(dat1$user_id))
+
+# keep participants with >=1 step in at least one lesson
+dat1 <- dat1 %>%
+  filter(rowSums(across(all_of(steps_cols), ~ !is.na(.x) & .x >= 1)) > 0)
+after_exclusion_steps <- length(unique(dat1$user_id))
+filtered_steps <- bef_exclusion_steps - after_exclusion_steps
+print(c("Participants excluded because they did not have at least 1 step in at least one lesson:", filtered_steps))
+
+# keep participants with a non-missing gain value in at least one lesson
+bef_exclusion_gain <- length(unique(dat1$user_id))
+dat1 <- dat1 %>%
+  filter(rowSums(across(all_of(gain_cols), ~ !is.na(.x))) > 0)
+after_exclusion_gain <- length(unique(dat1$user_id))
+filtered_gains <- bef_exclusion_gain - after_exclusion_gain
+print(c("Participants excluded because they did not have at least one value for learning Gain:", filtered_gains))
+
+# how many participants are not 18 years old?
+filtered_age <- dat1 %>%
+  filter(age < 18 | is.na(age))
+print(c("Participants excluded because they did not indicate to be above 18:",
+        length(unique(filtered_age$user_id))))
+
+dat1 <- dat1 %>%
+  filter(age >= 18)
+
+# all excluded users (for inspection)
+excluded_users <- before_exclusion %>%
+  anti_join(dat1, by = "user_id") %>%
+  dplyr::select(user_id) %>%
+  distinct()
+summary(excluded_users)
+
+
+remove(bef_exclusion_steps, after_exclusion_steps,
+       bef_exclusion_gain, after_exclusion_gain, filtered_age)
+
+dat1_select <- dat1
+```
+
+# Long Format
+
+Data with Engagement Time (ToF) needs to be in a long format, with 1 row per feedback instance
+
+```{r}
+
+# categorical covariates: NA becomes its own "Missing" level (base R, no new package needed)
+dat1_select <- dat1_select %>%
+  mutate(
+    gender = factor(ifelse(is.na(as.character(gender)), "Missing", as.character(gender))),
+    field  = factor(ifelse(is.na(as.character(field)),  "Missing", as.character(field))),
+    degree = factor(ifelse(is.na(as.character(degree)), "Missing", as.character(degree)))
+  )
+
+# age is continuous, so NA can't become a factor level the same way:
+# mean-impute it and add a missingness indicator, so "missing" is still
+# modeled explicitly instead of just dropping the row
+dat1_select <- dat1_select %>%
+  mutate(
+    age = ifelse(is.na(age), mean(age, na.rm = TRUE), age),
+    age_z = scale(age)
+  )
+
+# item-level columns to reshape (subject_item_measure)
+# I later want to investigate whether learners spent more time on the items that
+# were false compared to true
+item_cols <- grep("^(college|intermediate|statistics)_[0-9]+_(feedback_truth|feedback_length|ToF)$",
+                   names(dat1_select), value = TRUE)
+long_tof <- dat1_select %>%
+  pivot_longer(
+    cols = all_of(item_cols),
+    names_to = c("subject", "item", "measure"),
+    names_pattern = "(college|intermediate|statistics)_(\\d+)_(feedback_truth|feedback_length|ToF)",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = measure,
+    values_from = value
+  ) %>%
+  mutate(item_name = paste0(subject, "_", item)) %>%
+  dplyr::rename(accuracy = feedback_truth,
+                lesson = subject) %>%
+  mutate(lesson = case_when(
+    lesson == "college" ~ "C",
+    lesson == "intermediate" ~ "I",
+    lesson == "statistics" ~ "S"
+  ))
+
+# resolve the lesson-specific pre values that came along as wide
+# columns from dat1_select (no join against `dat` needed)
+long_tof$pre1 <- ifelse(long_tof$lesson == "I", long_tof$pre1_I,
+                  ifelse(long_tof$lesson == "C", long_tof$pre1_C,
+                  ifelse(long_tof$lesson == "S", long_tof$pre1_S, NA)))
+long_tof$pre2 <- ifelse(long_tof$lesson == "I", long_tof$pre2_I,
+                  ifelse(long_tof$lesson == "C", long_tof$pre2_C,
+                  ifelse(long_tof$lesson == "S", long_tof$pre2_S, NA)))
+
+long_tof <- long_tof %>%
+  mutate(pre = (pre1 + pre2) / 2) %>%
+  dplyr::select(user_id, condition, lesson, item_name, accuracy,
+                feedback_length, ToF, pre,
+                age, gender, field, degree)
+
+long_tof$condition <- factor(long_tof$condition, levels = c("Control", "Accurate", "Mixed", "Inaccurate"))
+long_tof$condition <- relevel(long_tof$condition, ref = "Control")
+table(long_tof$condition)
+
+long_tof <- long_tof %>%
+  mutate(ToF_z = scale(ToF),
+         feedback_length_z = scale(feedback_length),
+         pre_z = scale(pre))
+```
+
+For the descriptives of prior knowledge, I need one row per pre-test, so  one lesson is one row. Each user will have three rows
+
+```{r}
+long_tof_lesson <- long_tof %>%
+  group_by(user_id, condition, lesson) %>%
+  summarise(
+    mean_ToF = mean(ToF, na.rm = TRUE),
+    pre = first(pre),
+    Condition = first(condition),
+    mean_length = mean(feedback_length, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    pre_z = scale(pre),
+    mean_length_z = scale(mean_length),
+    mean_ToF_z = scale(mean_ToF)
+  )
+```
+
+# Descriptives
+
+```{r}
+dat_stats_total <- dat1_select %>%
+  summarise(
+    N = n(),
+    n_users = n_distinct(user_id),
+    across(c(motivation, sc), 
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE),
+                n = ~sum(!is.na(.x))), 
+           .names = "{.fn}_{.col}")
+  ) %>%
+  mutate(Condition = "Total") %>%
+  pivot_longer(
+    cols = -c(N, n_users, Condition),
+    names_to = c(".value", "Measure"),
+    names_sep = "_"
+  ) %>%
+  dplyr::select(Condition, Measure, n, mean, sd)
+
+dat_stats_Condition <- dat1_select %>%
+  group_by(Condition) %>%
+  summarise(
+    N = n(),
+    n_users = n_distinct(user_id),
+    across(c(motivation, sc), 
+           list(mean = ~mean(.x, na.rm = TRUE), 
+                sd = ~sd(.x, na.rm = TRUE),
+                n = ~sum(!is.na(.x))), 
+           .names = "{.fn}_{.col}")
+  ) %>%
+  pivot_longer(
+    cols = -c(N, n_users, Condition),
+    names_to = c(".value", "Measure"),
+    names_sep = "_"
+  ) %>%
+  dplyr::select(Condition, Measure, n, mean, sd)
+
+# Engagement time (ToF) lives in long_tof (one row per feedback instance),
+# not dat1_select, so it's summarised separately and bound in the same shape
+dat_stats_tof_total <- long_tof %>%
+  summarise(
+    n = sum(!is.na(ToF)),
+    mean = mean(ToF, na.rm = TRUE),
+    sd = sd(ToF, na.rm = TRUE)
+  ) %>%
+  mutate(Condition = "Total", Measure = "ToF")
+
+dat_stats_tof_condition <- long_tof %>%
+  group_by(condition) %>%
+  summarise(
+    n = sum(!is.na(ToF)),
+    mean = mean(ToF, na.rm = TRUE),
+    sd = sd(ToF, na.rm = TRUE)
+  ) %>%
+  dplyr::rename(Condition = condition) %>%
+  mutate(Measure = "ToF")
+# do the same for length
+dat_stats_length_total <- long_tof %>%
+  summarise(
+    n = sum(!is.na(feedback_length)),
+    mean = mean(feedback_length, na.rm = TRUE),
+    sd = sd(feedback_length, na.rm = TRUE)
+  ) %>%
+  mutate(Condition = "Total", Measure = "length")
+dat_stats_length_condition <- long_tof %>%
+  group_by(condition) %>%
+  summarise(
+    n = sum(!is.na(feedback_length)),
+    mean = mean(feedback_length, na.rm = TRUE),
+    sd = sd(feedback_length, na.rm = TRUE)
+  ) %>%
+  dplyr::rename(Condition = condition) %>%
+  mutate(Measure = "length")
+
+
+dat_stats_questions <- bind_rows(
+  dat_stats_total, dat_stats_Condition,
+  dat_stats_tof_total, dat_stats_tof_condition,
+  dat_stats_length_total, dat_stats_length_condition
+) %>%
+  pivot_wider(
+    names_from = Condition,
+    values_from = c(n, mean, sd),
+    names_glue = "{Condition}_{.value}"
+  ) %>%
+  dplyr::select(
+    Measure,
+    Total_n, Total_mean, Total_sd,
+    Control_n, Control_mean, Control_sd,
+    Accurate_n, Accurate_mean, Accurate_sd,
+    Mixed_n, Mixed_mean, Mixed_sd,
+    Inaccurate_n, Inaccurate_mean, Inaccurate_sd
+  )
+
+dat_stats_twisted <- dat_stats_questions %>%
+  pivot_longer(
+    cols = -Measure,
+    names_to = c("Condition", "stat"),
+    names_sep = "_"
+  ) %>%
+  pivot_wider(
+    names_from = c(Measure, stat),
+    values_from = value
+  ) %>%
+  arrange(factor(Condition, levels = c(
+    "Total", "Control", "Accurate", "Mixed", "Inaccurate"
+  )))
+
+dat_stats_twisted
+```
+
+
+## Correlations
+```{r}
+#Prior knowledge and learning gain were measured on the level of the lesson (i.e., 3 per learner). Engagement and length were measured on the level of the problem (i.e., 4 for each of the three lessons). Task motivation and Self-concept refer to the level of the learner. Each correlation was computed at the lowest possible level. Values were averaged on the next lowest possible level to compute correlations with higher level variables.  
+# level 1 data frame is is long_tof  (long format with twelve rows per user): for engagement and length
+# level 2 data frame is long_tof_lesson (long format with three rows per user): for prior knowledge and learning gain
+# level 3 data frame is dat1_select (wide format with one row per user): for engagement and self-concept
+
+# level 1: engagement and length
+cor.test(long_tof$ToF, long_tof$feedback_length)
+
+
+# level 2: matrix for engagement, length with prior knowledge and learning gain
+cor.test(long_tof_lesson$pre, long_tof_lesson$mean_ToF)
+cor.test(long_tof_lesson$pre, long_tof_lesson$mean_length)
+
+# level 3: matrix for all with motivation and self-concept
+dat1_select <- dat1_select %>%
+  mutate(mean_tof = rowMeans(dplyr::select(., ends_with("_ToF")), na.rm = TRUE),
+         mean_length = rowMeans(dplyr::select(., ends_with("_length")), na.rm = TRUE)
+  )
+
+cor.test(dat1_select$motivation, dat1_select$pre_mean)
+cor.test(dat1_select$motivation, dat1_select$mean_tof)
+cor.test(dat1_select$motivation, dat1_select$sc)
+cor.test(dat1_select$motivation, dat1_select$mean_length)
+cor.test(dat1_select$sc, dat1_select$pre_mean)
+cor.test(dat1_select$sc, dat1_select$mean_tof)
+cor.test(dat1_select$sc, dat1_select$mean_length)
+
+#compute the N of observations for each variable
+long_tof %>% summarise(across(c(ToF, feedback_length), ~ sum(!is.na(.)), .names = "n_{col}"))
+long_tof_lesson %>% summarise(across(c(pre, mean_ToF, mean_length), ~ sum(!is.na(.)), .names = "n_{col}"))
+dat1_select %>% summarise(across(c(motivation, pre_mean, mean_tof, sc, mean_length),
+                              ~ sum(!is.na(.)), .names = "n_{col}"))
+```
+
+# Models
+# Research Question 1: Task Motivation and Self-Concept
+# Motivation & Self-concept
+
+Prepare the data
+```{r}
+dat1_select$motivation_z <- scale(dat1_select$motivation)
+dat1_select$sc_z <- scale(dat1_select$sc)
+dat1_select$Condition <- factor(dat1_select$Condition, levels = c("Control", "Accurate", "Mixed", "Inaccurate"))
+dat1_select$condition_acc   <- relevel(dat1_select$Condition, ref = "Accurate")
+dat1_select$condition_inacc <- relevel(dat1_select$Condition, ref = "Inaccurate")
+
+# --- dummy-code every reference rotation: lavaan's syntax does not expand
+# factors the way lm()'s formula interface does ---
+mm_ctrl  <- model.matrix(~ Condition,       data = dat1_select)[, -1, drop = FALSE]
+mm_acc   <- model.matrix(~ condition_acc,   data = dat1_select)[, -1, drop = FALSE]
+mm_inacc <- model.matrix(~ condition_inacc, data = dat1_select)[, -1, drop = FALSE]
+
+colnames(mm_ctrl)  <- c("ConditionAccurate", "ConditionMixed", "ConditionInaccurate")
+colnames(mm_acc)   <- c("Condition_accControl", "Condition_accMixed", "Condition_accInaccurate")
+colnames(mm_inacc) <- c("Condition_inaccControl", "Condition_inaccAccurate", "Condition_inaccMixed")
+
+# dummy-code the covariates too (lavaan needs numeric predictors, not factors)
+mm_covs <- model.matrix(~ gender + field + degree, data = dat1_select)[, -1, drop = FALSE]
+colnames(mm_covs) <- make.names(colnames(mm_covs))
+cov_terms <- paste(colnames(mm_covs), collapse = " + ")  # reused in the _cov models below
+
+dat1_select <- dat1_select %>%
+  bind_cols(as.data.frame(mm_ctrl), as.data.frame(mm_acc),
+            as.data.frame(mm_inacc), as.data.frame(mm_covs))
+
+# product terms with prior knowledge, needed because lavaan does not expand
+# "Condition * pre_mean_z" the way lm() does
+dat1_select <- dat1_select %>%
+  mutate(
+    ConditionAccurate_pre       = ConditionAccurate * pre_mean_z,
+    ConditionMixed_pre          = ConditionMixed * pre_mean_z,
+    ConditionInaccurate_pre     = ConditionInaccurate * pre_mean_z,
+    Condition_accControl_pre    = Condition_accControl * pre_mean_z,
+    Condition_accMixed_pre      = Condition_accMixed * pre_mean_z,
+    Condition_accInaccurate_pre = Condition_accInaccurate * pre_mean_z,
+    Condition_inaccControl_pre  = Condition_inaccControl * pre_mean_z,
+    Condition_inaccAccurate_pre = Condition_inaccAccurate * pre_mean_z,
+    Condition_inaccMixed_pre    = Condition_inaccMixed * pre_mean_z
+  )
+```
+
+
+### Motivation: Model 1
+
+```{r}
+model_motivation <- '
+  motivation_z ~ b0*1 + b1*ConditionAccurate + b2*ConditionMixed + b3*ConditionInaccurate
+
+  # condition means 
+  Control_mean    := b0
+  Accurate_mean   := b0 + b1
+  Mixed_mean      := b0 + b2
+  Inaccurate_mean := b0 + b3
+
+  # pairwise contrasts 
+  Accurate_vs_Mixed      := b1 - b2
+  Accurate_vs_Inaccurate := b1 - b3
+  Mixed_vs_Inaccurate    := b2 - b3
+'
+fit_motivation <- sem(model_motivation, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+summary(fit_motivation, standardized = TRUE, fit.measures = TRUE)
+
+contrast_results_motivation <- parameterEstimates(fit_motivation, ci = TRUE) %>%
+  filter(op == ":=")
+contrast_results_motivation
+```
+
+
+
+
+
+# Motivation Model with Prior knowledge Interaction Term
+
+```{r}
+model_motivation_int <- '
+  motivation_z ~ 1 + ConditionAccurate + ConditionMixed + ConditionInaccurate +
+                 pre_mean_z + ConditionAccurate_pre + ConditionMixed_pre + ConditionInaccurate_pre
+'
+fit_motivation_int <- sem(model_motivation_int, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+
+model_motivation_int_acc <- '
+  motivation_z ~ 1 + Condition_accControl + Condition_accMixed + Condition_accInaccurate +
+                 pre_mean_z + Condition_accControl_pre + Condition_accMixed_pre + Condition_accInaccurate_pre
+'
+fit_motivation_int_acc <- sem(model_motivation_int_acc, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+
+model_motivation_int_inacc <- '
+  motivation_z ~ 1 + Condition_inaccControl + Condition_inaccAccurate + Condition_inaccMixed +
+                 pre_mean_z + Condition_inaccControl_pre + Condition_inaccAccurate_pre + Condition_inaccMixed_pre
+'
+fit_motivation_int_inacc <- sem(model_motivation_int_inacc, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+
+mot_int_summary <- rbind(
+  parameterEstimates(fit_motivation_int)[,      c("lhs","op","rhs","est","se","z","pvalue")],
+  parameterEstimates(fit_motivation_int_acc)[,   c("lhs","op","rhs","est","se","z","pvalue")],
+  parameterEstimates(fit_motivation_int_inacc)[, c("lhs","op","rhs","est","se","z","pvalue")]
+)
+mot_int_summary
+```
+
+### Robustness check: Include all covariates
+
+```{r}
+model_motivation_cov <- paste0('
+  motivation_z ~ 1 + ConditionAccurate + ConditionMixed + ConditionInaccurate +
+                 age_z + ', cov_terms, '
+')
+
+fit_motivation_cov <- sem(model_motivation_cov, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+summary(fit_motivation_cov, standardized = TRUE)
+
+model_motivation_int_cov <- paste0('
+  motivation_z ~ 1 + ConditionAccurate + ConditionMixed + ConditionInaccurate +
+                 pre_mean_z + ConditionAccurate_pre + ConditionMixed_pre + ConditionInaccurate_pre +
+                 age_z + ', cov_terms, '
+')
+fit_motivation_int_cov <- sem(model_motivation_int_cov, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+summary(fit_motivation_int_cov, standardized = TRUE)
+```
+
+
+
+# Self-concept
+
+### Self-concept: Model 1
+
+```{r}
+model_sc <- '
+  sc_z ~ c0*1 + c1*ConditionAccurate + c2*ConditionMixed + c3*ConditionInaccurate
+
+  Control_mean    := c0
+  Accurate_mean   := c0 + c1
+  Mixed_mean      := c0 + c2
+  Inaccurate_mean := c0 + c3
+
+  Accurate_vs_Mixed      := c1 - c2
+  Accurate_vs_Inaccurate := c1 - c3
+  Mixed_vs_Inaccurate    := c2 - c3
+'
+fit_sc <- sem(model_sc, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+summary(fit_sc, standardized = TRUE, fit.measures = TRUE)
+
+contrast_results_sc <- parameterEstimates(fit_sc, ci = TRUE) %>%
+  filter(op == ":=")
+contrast_results_sc
+```
+
+
+
+
+
+### Self-concept: Model with Interaction Term
+```{r}
+model_sc_int <- '
+  sc_z ~ 1 + ConditionAccurate + ConditionMixed + ConditionInaccurate +
+         pre_mean_z + ConditionAccurate_pre + ConditionMixed_pre + ConditionInaccurate_pre
+'
+fit_sc_int <- sem(model_sc_int, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+
+model_sc_int_acc <- '
+  sc_z ~ 1 + Condition_accControl + Condition_accMixed + Condition_accInaccurate +
+         pre_mean_z + Condition_accControl_pre + Condition_accMixed_pre + Condition_accInaccurate_pre
+'
+fit_sc_int_acc <- sem(model_sc_int_acc, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+
+model_sc_int_inacc <- '
+  sc_z ~ 1 + Condition_inaccControl + Condition_inaccAccurate + Condition_inaccMixed +
+         pre_mean_z + Condition_inaccControl_pre + Condition_inaccAccurate_pre + Condition_inaccMixed_pre
+'
+fit_sc_int_inacc <- sem(model_sc_int_inacc, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+
+rbind(
+  parameterEstimates(fit_sc_int)[,      c("lhs","op","rhs","est","se","z","pvalue")],
+  parameterEstimates(fit_sc_int_acc)[,   c("lhs","op","rhs","est","se","z","pvalue")],
+  parameterEstimates(fit_sc_int_inacc)[, c("lhs","op","rhs","est","se","z","pvalue")]
+)
+```
+
+
+
+### Robustness check: Include all covariates
+`
+```{r}
+model_sc_cov <- paste0('
+  sc_z ~ 1 + ConditionAccurate + ConditionMixed + ConditionInaccurate +
+         age_z + ', cov_terms, '
+')
+fit_sc_cov <- sem(model_sc_cov, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+summary(fit_sc_cov, standardized = TRUE)
+
+model_sc_int_cov <- paste0('
+  sc_z ~ 1 + ConditionAccurate + ConditionMixed + ConditionInaccurate +
+         pre_mean_z + ConditionAccurate_pre + ConditionMixed_pre + ConditionInaccurate_pre +
+         age_z + ', cov_terms, '
+')
+fit_sc_int_cov <- sem(model_sc_int_cov, data = dat1_select, missing = "fiml", fixed.x = FALSE)
+summary(fit_sc_int_cov, standardized = TRUE)
+```
+
+# Research Question 2: Engagement Time
+
+```{r}
+mod_tof <- lmerTest::lmer(ToF_z ~ condition + feedback_length_z+ (1|user_id)  + (1|item_name), data = long_tof)
+
+summary(mod_tof)
+# try a second model with feedback length as fixed effect and compare AIC and BIC in an ANOVA
+mod_tof2 <- lmerTest::lmer(ToF_z ~ condition + feedback_length_z + (1+feedback_length_z|user_id)  + (1|item_name), data = long_tof)
+summary(mod_tof2)
+anova(mod_tof, mod_tof2)
+
+#save fixed and random effects as csv
+summary(mod_tof2)
+```
+
+
+```{r}
+emmeans_tof <- emmeans(mod_tof2, ~ condition)
+contrasts <- list(
+"Accurate vs 50% Accurate" = c(0, 1, -1, 0), 
+"Accurate vs Inaccurate" = c(0, 1, 0, -1), 
+"50% Accurate vs Inaccurate" = c(0, 0, 1, -1)
+)
+contrast_results_tof <- contrast(emmeans_tof, method = contrasts)
+contrast_results_tof
+
+```
+
+
+```{r}
+# let's focus only on the mixed (50% hallucinations) condition
+long_tof_mixed <- long_tof %>%
+  filter(condition == "Mixed")
+# scale ToF
+long_tof_mixed <- long_tof_mixed %>%
+  mutate(ToF_z = scale(ToF)
+  )
+mod_tof_mixed <- lmer(ToF_z ~ accuracy + feedback_length_z + (1|user_id) + (1|item_name), data = long_tof_mixed)
+summary(mod_tof_mixed)
+```
+
+## TOF: With prior knowledge interaction term
+```{r}
+# to prepare the data, I must attach the respective lesson's pre-test score from the Long format data
+# always the respective one from the respective lesson
+mod_tof_int <- lmer(ToF_z ~ condition*pre_z + feedback_length_z + (1+feedback_length_z|user_id) + (1|item_name), data = long_tof)
+summary(mod_tof_int)
+
+# now with different reference categories
+# reference category "Accurate"
+long_tof$condition_acc <- relevel(long_tof$condition, ref = "Accurate")
+mod_tof_int_acc <- lmer(ToF_z ~ condition_acc*pre_z  + feedback_length_z + (1+feedback_length_z|user_id)+ (1|item_name), data = long_tof)
+
+# reference category "Inaccurate"
+long_tof$condition_inacc <- relevel(long_tof$condition, ref = "Inaccurate")
+mod_tof_int_inacc <- lmer(ToF_z ~ condition_inacc*pre_z  + feedback_length_z + (1+feedback_length_z|user_id)+ (1|item_name), data = long_tof)
+
+#attach these to fixed_effects_int 
+rbind(summary(mod_tof_int)$coefficients, summary(mod_tof_int_acc)$coefficients,  summary(mod_tof_int_inacc)$coefficients)
+
+# Show me the mean TOF per condition and per prior knowledge to understand the direction of the significant effect
+means <- long_tof %>%
+  group_by(condition, pre) %>%
+  summarise(
+    mean_ToF = mean(ToF, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+print(means)
+```
+
+
+```{r}
+# now look at the mixed condition
+
+mod_tof_mixed_int <- lmer(ToF_z ~ accuracy*pre_z + feedback_length_z + (1 | user_id) + (1 | item_name), data = long_tof_mixed)
+summary(mod_tof_mixed_int)
+
+```
+### Robustness check: Include all covariates
+```{r}
+
+mod_tof_cov <- lmerTest::lmer(ToF_z ~ condition + feedback_length_z + age +  gender + field + degree + (1+feedback_length_z|user_id) + (1|item_name), data = long_tof)
+summary(mod_tof_cov)
+emmeans_tof_cov <- emmeans(mod_tof_cov, ~ condition)
+contrast_results_tof_cov <- contrast(emmeans_tof_cov, method = contrasts)
+contrast_results_tof_cov
+
+#only 50% condition
+mod_tof_mixed_cov <- lmer(ToF_z ~ accuracy + feedback_length_z + age +  gender + field + degree + (1|user_id) + (1|item_name), data = long_tof_mixed)
+summary(mod_tof_mixed_cov)
+
+# with interaction term
+mod_tof_int_cov <- lmer(ToF_z ~ condition*pre_z + feedback_length_z + age +  gender + field + degree + (1+feedback_length_z|user_id) + (1|item_name), data = long_tof)
+summary(mod_tof_int_cov)
+mod_tof_mixed_int_cov <- lmer(ToF_z ~ accuracy*pre_z + feedback_length_z + age +  gender + field + degree + (1 | user_id) + (1 | item_name), data = long_tof_mixed)
+summary(mod_tof_mixed_int_cov)
+
+```
+# Plots
+
+## Intrinsic Motivation
+
+```{r}
+em_df_mot <- parameterEstimates(fit_motivation, ci = TRUE) %>%
+  filter(lhs %in% c("Accurate_mean", "Mixed_mean", "Inaccurate_mean")) %>%
+  transmute(
+    Condition = factor(dplyr::recode(lhs,
+                  Accurate_mean = "Accurate", Mixed_mean = "Mixed", Inaccurate_mean = "Inaccurate"),
+                  levels = c("Accurate", "Mixed", "Inaccurate")),
+    emmean = est, lower.CL = ci.lower, upper.CL = ci.upper
+  )
+
+
+
+em_df_mot <- em_df_mot %>%
+  filter(Condition != "Control")
+em_df_mot <- em_df_mot %>%
+  mutate(
+    Condition = factor(Condition, levels = c("Accurate", "Mixed", "Inaccurate" ))
+  )
+
+
+em_df_mot
+
+plot_mot <- ggplot(em_df_mot, aes(x = Condition, y = emmean)) +
+  geom_point(size = 3) +  # Plot the estimated means as points
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +  # Add error bars for CIs
+  labs(
+    title = "Task Motivation",
+    x = "Condition",
+    y = "z-score"
+  ) +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(     
+    text = element_text("serif", size = 14),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels if needed
+    axis.line = element_line(color = "black", size = 0.5),  # Add x and y axis lines
+    panel.grid = element_blank()  # Remove grid lines
+  ) +
+  scale_x_discrete(labels = c("0% Hallucinations", "50% Hallucinations", "100% Hallucinations" ))+  
+  ylim(-1, 1)  # Set common y-axis limits
+
+print(plot_mot)
+```
+
+
+# Self-concept
+
+```{r}
+
+em_df_sc <- parameterEstimates(fit_sc, ci = TRUE) %>%
+  filter(lhs %in% c("Control_mean", "Accurate_mean", "Mixed_mean", "Inaccurate_mean")) %>%
+  transmute(
+    Condition = factor(dplyr::recode(lhs,
+                  Control_mean = "Control", Accurate_mean = "Accurate",
+                  Mixed_mean = "Mixed", Inaccurate_mean = "Inaccurate"),
+                  levels = c("Control", "Accurate", "Mixed", "Inaccurate")),
+    emmean = est, lower.CL = ci.lower, upper.CL = ci.upper
+  )
+
+plot_sc <- ggplot(em_df_sc, aes(x = Condition, y = emmean)) +
+  geom_point(size = 3) +  # Plot the estimated means as points
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +  # Add error bars for CIs
+  labs(
+    title = "Self-Concept",
+    x = "Condition",
+    y = "z-score"
+  ) +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(     
+    text = element_text("serif", size = 14),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels if needed
+    axis.line = element_line(color = "black", size = 0.5),  # Add x and y axis lines
+    panel.grid = element_blank()  # Remove grid lines
+  ) +
+  scale_x_discrete(labels = c("No feedback", "0% Hallucinations", "50% Hallucinations", "100% Hallucinations" ))+  
+  ylim(-1, 1)  # Set common y-axis limits
+
+print(plot_sc)
+```
+
+
+## time on Feedback
+
+```{r}
+em_df_time <- as.data.frame(emmeans_tof)
+
+em_df_time <- em_df_time %>%
+  mutate(
+    Condition = factor(condition, levels = c( "Control", "Accurate", "Mixed", "Inaccurate" ))
+  )
+# Create the ggplot
+plot_time <- ggplot(em_df_time, aes(x = Condition, y = emmean)) +
+  geom_point(size = 3) +  # Plot the estimated means as points
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL), width = 0.2) +  # Add error bars for CIs
+  labs(
+    title = "Engagement",
+    x = "Condition",
+    y = "z-score"
+  ) +
+  theme_minimal() +  # Use a minimal theme for a clean look
+  theme(
+    text = element_text("serif", size = 14),
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 45, hjust = 1),  # Rotate x-axis labels if needed
+    axis.line = element_line(color = "black", size = 0.5),  # Add x and y axis lines
+    panel.grid = element_blank()  # Remove grid lines
+  ) +
+  scale_x_discrete(labels = c( "No feedback", "0% Hallucinations", "50% Hallucinations", "100% Hallucinations" )) +
+  ylim(-1, 1)  # Set common y-axis limits
+
+print(plot_time)
+
+```
+
+
